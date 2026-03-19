@@ -1,19 +1,22 @@
 # ============================================================
-# POLYMARKET BTC BOT
+# POLYMARKET BTC BOT - Updated Authentication
 # Strategy: Bet $2 on any side at $0.01 odds with >80s left
 # Markets: BTC 5min, 15min, 1hr, 4hr
 # ============================================================
 
+import os
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 # ============================================================
-# CONFIG — PASTE YOUR KEYS HERE (never share these with anyone)
+# CONFIG — pulled from Railway environment variables
 # ============================================================
-POLYMARKET_API_KEY    = "YOUR_API_KEY_HERE"
-POLYMARKET_SECRET     = "YOUR_SECRET_HERE"
-POLYMARKET_PASSPHRASE = "YOUR_PASSPHRASE_HERE"
+PRIVATE_KEY       = os.environ.get("POLYMARKET_PRIVATE_KEY")
+API_KEY           = os.environ.get("POLYMARKET_API_KEY")
+ADDRESS           = os.environ.get("POLYMARKET_ADDRESS")
 
 BET_SIZE        = 2.00    # $ per bet
 TRIGGER_ODDS    = 0.01    # trigger at $0.01
@@ -21,50 +24,65 @@ MIN_TIME_LEFT   = 80      # seconds (1 min 20 sec)
 POLL_INTERVAL   = 5       # how often to check markets (seconds)
 
 # ============================================================
-# BTC MARKET IDs on Polymarket
-# Find these at polymarket.com — search BTC and copy the
-# market ID from the URL e.g. polymarket.com/event/MARKET-ID
+# BTC MARKET IDs — paste these in once you find them
 # ============================================================
 MARKETS = {
-    "BTC-5MIN":  "PASTE_5MIN_MARKET_ID_HERE",
-    "BTC-15MIN": "PASTE_15MIN_MARKET_ID_HERE",
-    "BTC-1HR":   "PASTE_1HR_MARKET_ID_HERE",
-    "BTC-4HR":   "PASTE_4HR_MARKET_ID_HERE",
+    "BTC-5MIN":  os.environ.get("MARKET_5MIN",  ""),
+    "BTC-15MIN": os.environ.get("MARKET_15MIN", ""),
+    "BTC-1HR":   os.environ.get("MARKET_1HR",   ""),
+    "BTC-4HR":   os.environ.get("MARKET_4HR",   ""),
 }
 
-# ============================================================
-# POLYMARKET API SETUP
-# ============================================================
 BASE_URL = "https://clob.polymarket.com"
 
-def get_headers():
-    return {
-        "Authorization": f"Bearer {POLYMARKET_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+# ============================================================
+# LOGGING
+# ============================================================
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}] {msg}", flush=True)
+
+# ============================================================
+# AUTH — sign requests with private key
+# ============================================================
+def get_auth_headers():
+    timestamp = str(int(time.time()))
+    message = f"{timestamp}GET/auth/api-key"
+    msg = encode_defunct(text=message)
+    signed = Account.sign_message(msg, private_key=PRIVATE_KEY)
+    signature = signed.signature.hex()
+    return {
+        "POLY_ADDRESS":   ADDRESS,
+        "POLY-SIGNATURE": signature,
+        "POLY-TIMESTAMP": timestamp,
+        "POLY-API-KEY":   API_KEY,
+        "Content-Type":   "application/json",
+    }
 
 # ============================================================
 # FETCH MARKET DATA
 # ============================================================
 def get_market(market_id):
     try:
-        r = requests.get(f"{BASE_URL}/markets/{market_id}", headers=get_headers(), timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/markets/{market_id}",
+            headers=get_auth_headers(),
+            timeout=10
+        )
         if r.status_code == 200:
             return r.json()
-        else:
-            log(f"ERROR fetching market {market_id}: {r.status_code}")
-            return None
+        log(f"ERROR fetching market {market_id}: {r.status_code} {r.text}")
+        return None
     except Exception as e:
         log(f"EXCEPTION fetching market: {e}")
         return None
 
 def get_orderbook(token_id):
     try:
-        r = requests.get(f"{BASE_URL}/book?token_id={token_id}", headers=get_headers(), timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/book?token_id={token_id}",
+            timeout=10
+        )
         if r.status_code == 200:
             return r.json()
         return None
@@ -73,7 +91,6 @@ def get_orderbook(token_id):
         return None
 
 def get_best_ask(orderbook):
-    """Get the best (lowest) ask price from the orderbook."""
     try:
         asks = orderbook.get("asks", [])
         if not asks:
@@ -83,16 +100,13 @@ def get_best_ask(orderbook):
         return None
 
 def seconds_until_resolution(market_data):
-    """Calculate seconds left until market resolves."""
     try:
         end_time = market_data.get("end_date_iso") or market_data.get("game_start_time")
         if not end_time:
             return None
-        from datetime import timezone
         end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
         now_dt = datetime.now(timezone.utc)
-        delta = (end_dt - now_dt).total_seconds()
-        return max(0, delta)
+        return max(0, (end_dt - now_dt).total_seconds())
     except Exception as e:
         log(f"EXCEPTION parsing time: {e}")
         return None
@@ -101,33 +115,49 @@ def seconds_until_resolution(market_data):
 # PLACE BET
 # ============================================================
 def place_bet(token_id, side, amount, odds):
-    """Place a market order on Polymarket."""
-    log(f">>> PLACING BET: {side} | ${amount} @ ${odds} odds | Token: {token_id[:12]}...")
-    
+    log(f">>> PLACING BET: {side} | ${amount} @ ${odds} odds")
     order = {
         "token_id": token_id,
-        "price": odds,
-        "size": amount,
-        "side": side,       # "BUY"
-        "type": "MARKET",
+        "price":    str(odds),
+        "size":     str(amount),
+        "side":     side,
+        "type":     "MARKET",
+        "funder":   ADDRESS,
     }
-
     try:
         r = requests.post(
             f"{BASE_URL}/order",
             json=order,
-            headers=get_headers(),
+            headers=get_auth_headers(),
             timeout=15
         )
         if r.status_code in (200, 201):
-            log(f"✅ BET PLACED SUCCESSFULLY: {r.json()}")
+            log(f"✅ BET PLACED: {r.json()}")
             return True
-        else:
-            log(f"❌ BET FAILED: {r.status_code} — {r.text}")
-            return False
+        log(f"❌ BET FAILED: {r.status_code} — {r.text}")
+        return False
     except Exception as e:
         log(f"❌ EXCEPTION placing bet: {e}")
         return False
+
+# ============================================================
+# STARTUP CHECKS
+# ============================================================
+def check_config():
+    if not PRIVATE_KEY:
+        log("❌ POLYMARKET_PRIVATE_KEY not set in environment variables!")
+        return False
+    if not API_KEY:
+        log("❌ POLYMARKET_API_KEY not set in environment variables!")
+        return False
+    if not ADDRESS:
+        log("❌ POLYMARKET_ADDRESS not set in environment variables!")
+        return False
+    missing_markets = [k for k, v in MARKETS.items() if not v]
+    if missing_markets:
+        log(f"⚠️  Market IDs missing for: {', '.join(missing_markets)}")
+        log("⚠️  Bot will skip those markets until IDs are added")
+    return True
 
 # ============================================================
 # MAIN BOT LOOP
@@ -135,80 +165,72 @@ def place_bet(token_id, side, amount, odds):
 def run_bot():
     log("=" * 50)
     log("POLYMARKET BTC BOT STARTING")
-    log(f"Strategy : Bet ${BET_SIZE} when odds = ${TRIGGER_ODDS}")
-    log(f"Condition: >{ MIN_TIME_LEFT}s left on market")
+    log(f"Strategy : Bet ${BET_SIZE} when odds <= ${TRIGGER_ODDS}")
+    log(f"Condition: >{MIN_TIME_LEFT}s left on market")
     log(f"Markets  : {', '.join(MARKETS.keys())}")
     log("=" * 50)
 
-    # Track which markets we've already bet on this cycle
+    if not check_config():
+        log("❌ Fix config errors above then restart.")
+        return
+
     bets_placed = {k: {"YES": False, "NO": False} for k in MARKETS}
 
     while True:
         for market_name, market_id in MARKETS.items():
-            log(f"--- Checking {market_name} ---")
+            if not market_id:
+                continue
 
-            # Fetch market
+            log(f"--- Checking {market_name} ---")
             market_data = get_market(market_id)
             if not market_data:
                 continue
 
-            # Check time left
             time_left = seconds_until_resolution(market_data)
             if time_left is None:
-                log(f"  Could not determine time left for {market_name}")
                 continue
 
             mins = int(time_left // 60)
             secs = int(time_left % 60)
             log(f"  Time left: {mins}m {secs}s")
 
-            # Reset bets if market has reset (new cycle)
             if time_left > (MIN_TIME_LEFT + 60):
                 bets_placed[market_name] = {"YES": False, "NO": False}
 
             if time_left <= MIN_TIME_LEFT:
-                log(f"  ⏱ SKIP — too close to resolution ({mins}m {secs}s left)")
+                log(f"  ⏱ SKIP — too close to resolution")
                 continue
 
-            # Get tokens (YES and NO)
             tokens = market_data.get("tokens", [])
             for token in tokens:
-                outcome = token.get("outcome", "").upper()  # "YES" or "NO"
+                outcome = token.get("outcome", "").upper()
                 token_id = token.get("token_id")
 
                 if not token_id or outcome not in ("YES", "NO"):
                     continue
-
                 if bets_placed[market_name][outcome]:
-                    log(f"  Already bet {outcome} this cycle, skipping")
                     continue
 
-                # Get orderbook to find current ask price
                 orderbook = get_orderbook(token_id)
                 if not orderbook:
                     continue
 
                 best_ask = get_best_ask(orderbook)
                 if best_ask is None:
-                    log(f"  No asks available for {outcome}")
                     continue
 
                 log(f"  {outcome} best ask: ${best_ask:.4f}")
 
-                # CHECK TRIGGER
                 if best_ask <= TRIGGER_ODDS:
-                    log(f"  🎯 SIGNAL! {market_name} {outcome} @ ${best_ask} with {mins}m {secs}s left")
+                    log(f"  🎯 SIGNAL! {market_name} {outcome} @ ${best_ask} | {mins}m {secs}s left")
                     success = place_bet(token_id, "BUY", BET_SIZE, best_ask)
                     if success:
                         bets_placed[market_name][outcome] = True
                 else:
-                    log(f"  No signal for {outcome} (${best_ask:.4f} > ${TRIGGER_ODDS})")
+                    log(f"  No signal (${best_ask:.4f} > ${TRIGGER_ODDS})")
 
-        log(f"Sleeping {POLL_INTERVAL}s before next scan...\n")
+        log(f"Sleeping {POLL_INTERVAL}s...\n")
         time.sleep(POLL_INTERVAL)
 
-# ============================================================
-# RUN
-# ============================================================
 if __name__ == "__main__":
     run_bot()
