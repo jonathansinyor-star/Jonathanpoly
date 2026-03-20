@@ -1,15 +1,15 @@
 # ============================================================
-# POLYMARKET BTC BOT - Correct Token ID fetching from CLOB
+# POLYMARKET BTC BOT - Correct clobTokenIds parsing
 # Strategy: Bet $2 on any side at $0.01 odds with >80s left
 # ============================================================
 
 import os
 import time
+import json
 import requests
 from datetime import datetime, timezone
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
 
 # ============================================================
 # CONFIG
@@ -19,7 +19,7 @@ ADDRESS     = os.environ.get("POLYMARKET_ADDRESS")
 
 BET_SIZE      = 2.00
 TRIGGER_ODDS  = 0.01
-MIN_TIME_LEFT = 80
+MIN_TIME_LEFT = 80    # seconds (1m 20s)
 POLL_INTERVAL = 10
 
 HOST      = "https://clob.polymarket.com"
@@ -33,7 +33,7 @@ INTERVALS = {
     "BTC-4H":  240 * 60,
 }
 
-SLUG_MAP = {
+SLUG_PREFIX = {
     "BTC-5M":  "btc-updown-5m",
     "BTC-15M": "btc-updown-15m",
     "BTC-1H":  "btc-updown-1h",
@@ -48,62 +48,88 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 # ============================================================
-# GET CURRENT SLUG AND END TIME
+# SLUG + TIME HELPERS
 # ============================================================
 def get_slug_and_end(label):
-    interval_secs = INTERVALS[label]
-    now_ts = int(time.time())
-    interval_start = (now_ts // interval_secs) * interval_secs
-    end_ts = interval_start + interval_secs
-    slug = f"{SLUG_MAP[label]}-{interval_start}"
+    interval = INTERVALS[label]
+    now_ts   = int(time.time())
+    window   = (now_ts // interval) * interval   # round down to interval
+    slug     = f"{SLUG_PREFIX[label]}-{window}"
+    end_ts   = window + interval
     return slug, end_ts
 
 # ============================================================
-# GET TOKEN IDs FROM CLOB API (correct source)
+# GET TOKEN IDs FROM GAMMA /markets (correct endpoint)
+# clobTokenIds is a JSON-encoded STRING â must use json.loads
 # ============================================================
-def get_tokens_from_clob(client, slug):
-    """Fetch token IDs directly from CLOB /markets endpoint by slug."""
+def get_token_ids(slug):
     try:
-        # Get paginated markets and search for our slug
-        result = client.get_markets()
-        markets = result.get("data", []) if isinstance(result, dict) else result
+        r = requests.get(
+            f"{GAMMA_URL}/markets",
+            params={"slug": slug, "active": "true", "closed": "false"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            log(f"  Gamma /markets returned {r.status_code}")
+            return None, None
 
-        for market in markets:
-            if market.get("market_slug") == slug:
-                tokens = market.get("tokens", [])
-                if len(tokens) >= 2:
-                    yes_id = next((t["token_id"] for t in tokens if t["outcome"] == "Yes"), None)
-                    no_id  = next((t["token_id"] for t in tokens if t["outcome"] == "No"),  None)
-                    if yes_id and no_id:
-                        log(f"  â Found tokens via CLOB for {slug}")
-                        return yes_id, no_id, market.get("end_date_iso")
+        data = r.json()
+        markets = data if isinstance(data, list) else data.get("data", [])
 
-        # Fallback: try Gamma API for condition_id then CLOB
-        r = requests.get(f"{GAMMA_URL}/events", params={"slug": slug}, timeout=10)
-        if r.status_code == 200 and r.json():
-            event = r.json()[0]
-            event_markets = event.get("markets", [])
-            if event_markets:
-                condition_id = event_markets[0].get("conditionId")
-                if condition_id:
-                    clob_market = client.get_market(condition_id)
-                    if clob_market:
-                        tokens = clob_market.get("tokens", [])
-                        if len(tokens) >= 2:
-                            yes_id = next((t["token_id"] for t in tokens if t["outcome"] == "Yes"), None)
-                            no_id  = next((t["token_id"] for t in tokens if t["outcome"] == "No"),  None)
-                            end_date = clob_market.get("end_date_iso")
-                            if yes_id and no_id:
-                                log(f"  â Found tokens via Gamma+CLOB for {slug}")
-                                return yes_id, no_id, end_date
+        if not markets:
+            log(f"  No market found for slug: {slug}")
+            return None, None
 
-        return None, None, None
+        market = markets[0]
+
+        # clobTokenIds is stored as a JSON STRING â parse it
+        raw = market.get("clobTokenIds", "[]")
+        if isinstance(raw, str):
+            token_ids = json.loads(raw)
+        else:
+            token_ids = raw
+
+        if len(token_ids) < 2:
+            log(f"  Not enough token IDs: {token_ids}")
+            return None, None
+
+        yes_id = token_ids[0]
+        no_id  = token_ids[1]
+        log(f"  â Tokens found â YES: ...{yes_id[-6:]}, NO: ...{no_id[-6:]}")
+        return yes_id, no_id
+
     except Exception as e:
         log(f"  Exception getting tokens: {e}")
-        return None, None, None
+        return None, None
 
 # ============================================================
-# PLACE BET
+# GET BEST ASK PRICE FROM CLOB ORDERBOOK
+# ============================================================
+def get_best_ask(token_id):
+    try:
+        r = requests.get(
+            f"{HOST}/book",
+            params={"token_id": token_id},
+            timeout=10
+        )
+        if r.status_code != 200:
+            log(f"  Orderbook returned {r.status_code} for token ...{token_id[-6:]}")
+            return None
+
+        book = r.json()
+        asks = book.get("asks", [])
+        if not asks:
+            return None
+
+        best = min(float(a["price"]) for a in asks)
+        return best
+
+    except Exception as e:
+        log(f"  Exception getting orderbook: {e}")
+        return None
+
+# ============================================================
+# PLACE BET VIA py-clob-client
 # ============================================================
 def place_bet(client, token_id, amount):
     try:
@@ -121,16 +147,17 @@ def place_bet(client, token_id, amount):
 # ============================================================
 def run_bot():
     log("=" * 55)
-    log("POLYMARKET BTC BOT â CLOB Token IDs v5")
+    log("POLYMARKET BTC BOT â Fixed Token IDs v6")
     log(f"Strategy : Bet ${BET_SIZE} when odds <= ${TRIGGER_ODDS}")
     log(f"Condition: >{MIN_TIME_LEFT}s left on market")
     log("=" * 55)
 
-    if not all([PRIVATE_KEY, ADDRESS]):
+    if not PRIVATE_KEY or not ADDRESS:
         log("â Missing POLYMARKET_PRIVATE_KEY or POLYMARKET_ADDRESS!")
         return
 
-    # Init CLOB client (email/magic wallet = signature_type=1)
+    # Init CLOB client
+    # signature_type=1 = Magic/email wallet (not MetaMask)
     try:
         client = ClobClient(
             HOST,
@@ -145,60 +172,62 @@ def run_bot():
         log(f"â CLOB init failed: {e}")
         return
 
-    bets_placed = {}
-    token_cache = {}  # cache tokens per slug
+    bets_placed  = {}   # slug -> {YES: bool, NO: bool}
+    token_cache  = {}   # slug -> (yes_id, no_id)
 
     while True:
         now_ts = int(time.time())
 
         for label in INTERVALS:
-            slug, end_ts = get_slug_and_end(label)
-            time_left = end_ts - now_ts
-            mins = int(time_left // 60)
-            secs = int(time_left % 60)
+            slug, end_ts  = get_slug_and_end(label)
+            time_left     = end_ts - now_ts
+            mins          = int(time_left // 60)
+            secs          = int(time_left % 60)
 
-            log(f"--- {label} | {mins}m {secs}s left ---")
+            log(f"--- {label} | {mins}m {secs}s left | {slug} ---")
 
+            # Too close to resolution â skip and clear cache
             if time_left <= MIN_TIME_LEFT:
-                log(f"  â± SKIP â too close to resolution")
-                # Clear cache so new market fetched next cycle
+                log(f"  â± SKIP â {mins}m {secs}s left (need >{MIN_TIME_LEFT}s)")
                 token_cache.pop(slug, None)
                 continue
 
-            # Reset bets on new slug
+            # New slug = new cycle, reset bet tracking
             if slug not in bets_placed:
                 bets_placed = {slug: {"YES": False, "NO": False}}
 
-            # Get token IDs (use cache if available)
+            # Get token IDs (cached per slug)
             if slug not in token_cache:
-                yes_id, no_id, _ = get_tokens_from_clob(client, slug)
-                if yes_id and no_id:
-                    token_cache[slug] = (yes_id, no_id)
+                yes_id, no_id = get_token_ids(slug)
+                if not yes_id:
+                    continue
+                token_cache[slug] = (yes_id, no_id)
+
+            yes_id, no_id = token_cache[slug]
+
+            # Check YES
+            if not bets_placed[slug]["YES"]:
+                ask = get_best_ask(yes_id)
+                if ask is not None:
+                    log(f"  YES ask: ${ask:.4f}")
+                    if ask <= TRIGGER_ODDS:
+                        log(f"  ð¯ SIGNAL YES @ ${ask} | {mins}m {secs}s left")
+                        if place_bet(client, yes_id, BET_SIZE):
+                            bets_placed[slug]["YES"] = True
                 else:
-                    log(f"  â Could not get tokens for {slug}")
-                    continue
-            else:
-                yes_id, no_id = token_cache[slug]
+                    log(f"  YES: no ask available")
 
-            for outcome, token_id in [("YES", yes_id), ("NO", no_id)]:
-                if bets_placed[slug].get(outcome):
-                    continue
-
-                try:
-                    price_data = client.get_price(token_id, side="BUY")
-                    best_ask = float(price_data.get("price", 1.0))
-                    log(f"  {outcome}: ${best_ask:.4f}")
-
-                    if best_ask <= TRIGGER_ODDS:
-                        log(f"  ð¯ SIGNAL! {label} {outcome} @ ${best_ask} | {mins}m {secs}s left")
-                        success = place_bet(client, token_id, BET_SIZE)
-                        if success:
-                            bets_placed[slug][outcome] = True
-                    else:
-                        log(f"  No signal (${best_ask:.4f} > ${TRIGGER_ODDS})")
-
-                except Exception as e:
-                    log(f"  Error for {outcome}: {e}")
+            # Check NO
+            if not bets_placed[slug]["NO"]:
+                ask = get_best_ask(no_id)
+                if ask is not None:
+                    log(f"  NO  ask: ${ask:.4f}")
+                    if ask <= TRIGGER_ODDS:
+                        log(f"  ð¯ SIGNAL NO  @ ${ask} | {mins}m {secs}s left")
+                        if place_bet(client, no_id, BET_SIZE):
+                            bets_placed[slug]["NO"] = True
+                else:
+                    log(f"  NO: no ask available")
 
         log(f"ð¤ Sleeping {POLL_INTERVAL}s...\n")
         time.sleep(POLL_INTERVAL)
