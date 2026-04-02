@@ -1,1 +1,1 @@
-worker: python polymarket_btc_bot.py
+web: python polymarket_btc_bot.py
